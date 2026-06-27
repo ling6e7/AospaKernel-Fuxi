@@ -1,0 +1,189 @@
+name: Build ReSukiSU LKM Kernel
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - LKM-Build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg libssl-dev libelf-dev \
+            cpio zip xz-utils wget python3 unzip
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      - name: Setup ReSukiSU (LKM source)
+        run: |
+          rm -rf KernelSU
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+
+          # 伪造 git submodule 结构（ReSukiSU Kbuild 检查 ../.git）
+          # .git 文件指向一个 dummy gitdir
+          mkdir -p .git/modules/KernelSU
+          echo "gitdir: ../.git/modules/KernelSU" > KernelSU/.git
+          # shallow clone 需要 .git/shallow
+          touch .git/modules/KernelSU/shallow
+
+      - name: Setup Re:Kernel
+        run: |
+          rm -rf Re-Kernel
+          git clone --depth=1 https://github.com/myflavor/Re-Kernel.git Re-Kernel
+          mkdir -p drivers/rekernel
+          cp -f Re-Kernel/LKM-Source/rekernel.c drivers/rekernel/
+          cp -f Re-Kernel/LKM-Source/rekernel.h drivers/rekernel/
+
+      - name: Prepare ccache
+        run: mkdir -p ~/.ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-lkm-${{ github.ref_name }}
+          restore-keys: ccache-lkm-
+
+      - name: Build kernel Image (KSU disabled)
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/toolchains/clang/bin:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+          ccache -M 8G
+
+          # 1. 生成 defconfig
+          make LLVM=1 LLVM_IAS=1 O=out fuxi_defconfig -j$(nproc --all)
+
+          # 2. 运行时覆盖：built-in → LKM（不修改仓库文件）
+          ./scripts/config --file out/.config -m KSU
+          ./scripts/config --file out/.config -d KSU_DEBUG
+
+          # 3. 自动补齐依赖
+          make LLVM=1 LLVM_IAS=1 O=out olddefconfig 2>&1 | tail -5
+
+          # 4. 确认配置
+          echo "=== KSU config ==="
+          grep 'CONFIG_KSU' out/.config || true
+          echo "=================="
+
+          # 5. 编译内核（不含 KSU built-in）
+          make LLVM=1 LLVM_IAS=1 O=out LOCALVERSION=-LKM Image -j$(nproc --all) 2>&1 | tee out/build.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+          fi
+
+      - name: Build ReSukiSU kernel module (.ko)
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/toolchains/clang/bin:$PATH"
+
+          # 从内核根目录编译 out-of-tree 模块
+          # M= 指向 ReSukiSU 的 kernel 目录
+          make LLVM=1 LLVM_IAS=1 O=out \
+            M=$(pwd)/KernelSU/kernel \
+            modules -j$(nproc --all) 2>&1 | tee out/kmod_build.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Module build failed. Last 30 lines:"
+            tail -30 out/kmod_build.log
+            exit 1
+          fi
+
+          echo "=== Build result ==="
+          find KernelSU/kernel -name "*.ko" 2>/dev/null
+          echo "===================="
+
+          KO_FILE=$(find KernelSU/kernel -name "kernelsu.ko" | head -1)
+          if [ -z "$KO_FILE" ]; then
+            echo "ERROR: kernelsu.ko not found"
+            exit 1
+          fi
+          echo "Module built: $KO_FILE"
+
+      - name: Package flashable zip
+        run: |
+          if [ ! -d AnyKernel3 ]; then
+            echo "AnyKernel3 directory not found"
+            exit 1
+          fi
+          if [ ! -f out/arch/arm64/boot/Image ]; then
+            echo "Image not found"
+            exit 1
+          fi
+
+          rm -rf out/AnyKernel3
+          cp -r AnyKernel3 out/
+          cp out/arch/arm64/boot/Image out/AnyKernel3/Image
+
+          # 复制 kernelsu.ko
+          KO_FILE=$(find KernelSU/kernel -name "kernelsu.ko" | head -1)
+          if [ -n "$KO_FILE" ]; then
+            mkdir -p out/AnyKernel3/modules/system/lib/modules
+            cp "$KO_FILE" out/AnyKernel3/modules/system/lib/modules/
+            echo "Copied module: $KO_FILE"
+          else
+            echo "WARNING: kernelsu.ko not found"
+          fi
+
+          cd out/AnyKernel3
+          ZIPNAME="Fuxi-ReSukiSU-LKM-$(date -u '+%Y%m%d-%H%M').zip"
+          zip -r9 "$ZIPNAME" .
+          mv "$ZIPNAME" ../../
+          echo "=== Package complete ==="
+          ls -lh "../../$ZIPNAME"
+
+      - name: Upload to Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          ZIP_FILE=$(ls Fuxi-ReSukiSU-LKM-*.zip 2>/dev/null | head -1)
+          if [ -n "$ZIP_FILE" ] && [ -n "$TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            curl -s -F chat_id="$CHAT_ID" \
+              -F document=@"$ZIP_FILE" \
+              -F "caption=✅ ReSukiSU LKM 内核 - LKM-${{ github.run_number }}" \
+              "https://api.telegram.org/bot${TOKEN}/sendDocument"
+          else
+            echo "Telegram upload skipped"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Fuxi-ReSukiSU-LKM-Kernel
+          path: "Fuxi-ReSukiSU-LKM-*.zip"
+          if-no-files-found: error
+
+      - name: Create Release
+        if: github.ref == 'refs/heads/LKM-Build'
+        run: |
+          GH_TOKEN=${{ github.token }} gh release create LKM-${{ github.run_number }} Fuxi-ReSukiSU-LKM-*.zip \
+            --repo ${{ github.repository }} \
+            --title "ReSukiSU LKM 内核 #${{ github.run_number }}" \
+            --generate-notes
