@@ -47,14 +47,16 @@ jobs:
       - name: Setup Re:Kernel (with git for auto-update)
         run: |
           rm -rf Re-Kernel
-          git clone --depth=1 https://github.com/myflavor/Re-Kernel.git Re-Kernel
+          git clone --depth=1 -b generic https://github.com/myflavor/Re-Kernel.git Re-Kernel
           mkdir -p drivers/rekernel
           # Remove old single-file source if present
           rm -f drivers/rekernel/rekernel.c
           # Copy all new source files
           cp -f Re-Kernel/LKM-Source/*.c drivers/rekernel/
           cp -f Re-Kernel/LKM-Source/*.h drivers/rekernel/
-
+          # Copy updated Makefile and Kconfig
+          cp -f Re-Kernel/LKM-Source/Makefile drivers/rekernel/
+          cp -f Re-Kernel/LKM-Source/Kconfig drivers/rekernel/
 
       - name: Prepare ccache
         run: mkdir -p ~/.ccache
