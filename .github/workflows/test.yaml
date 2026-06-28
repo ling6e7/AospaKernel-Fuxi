@@ -1,0 +1,128 @@
+name: 构建 ReSukiSU 内核-test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - AospaFuxi
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg libssl-dev libelf-dev \
+            cpio zip xz-utils wget python3
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      - name: Setup ReSukiSU
+        run: |
+          rm -rf KernelSU
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          rm -f drivers/kernelsu
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+
+      - name: Setup Re:Kernel (with git for auto-update)
+        run: |
+          rm -rf Re-Kernel
+          git clone --depth=1 -b generic https://github.com/myflavor/Re-Kernel.git Re-Kernel
+          mkdir -p drivers/rekernel
+
+          rm -f drivers/rekernel/rekernel.c
+          # Copy all new source files
+          cp -f Re-Kernel/LKM-Source/*.c drivers/rekernel/
+          cp -f Re-Kernel/LKM-Source/*.h drivers/rekernel/
+
+
+      - name: Prepare ccache
+        run: mkdir -p ~/.ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}
+          restore-keys: ccache-
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/toolchains/clang/bin:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+          ccache -M 8G
+          make LLVM=1 LLVM_IAS=1 O=out LOCALVERSION=-By@Samrtin fuxi_defconfig -j$(nproc --all)
+          make LLVM=1 LLVM_IAS=1 O=out olddefconfig 2>&1 | tail -3
+          make LLVM=1 LLVM_IAS=1 O=out LOCALVERSION=-By@Samrtin Image -j$(nproc --all) 2>&1 | tee out/build.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+          fi
+
+      - name: Package flashable zip
+        run: |
+          if [ -d AnyKernel3 ] && [ -f out/arch/arm64/boot/Image ]; then
+            rm -rf out/AnyKernel3
+            cp -r AnyKernel3 out/
+            cp out/arch/arm64/boot/Image out/AnyKernel3/Image
+            cd out/AnyKernel3
+            ZIPNAME="Fuxi-ResukiSU-$(date -u '+%Y%m%d-%H%M').zip"
+            zip -r9 "$ZIPNAME" .
+            mv "$ZIPNAME" ../../
+            echo "Zip created"
+          else
+            echo "Image not found"
+            exit 1
+          fi
+
+      - name: Upload to Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          ZIP_FILE=$(ls Fuxi-ResukiSU-*.zip 2>/dev/null | head -1)
+          if [ -n "$ZIP_FILE" ] && [ -n "$TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            curl -s -F chat_id="$CHAT_ID" \
+              -F document=@"$ZIP_FILE" \
+              -F "caption=✅ ReSukiSU 内核编译完成 - 构建号: AospaFuxi-${{ github.run_number }}" \
+              "https://api.telegram.org/bot${TOKEN}/sendDocument"
+          else
+            echo "Telegram upload skipped (missing token/chat_id or zip)"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AospaFuxi-Kernel
+          path: "Fuxi-ResukiSU-*.zip"
+          if-no-files-found: warn
+
+      - name: Create Release
+        if: github.ref == 'refs/heads/AospaFuxi'
+        run: |
+          GH_TOKEN=${{ github.token }} gh release create AospaFuxi-${{ github.run_number }} Fuxi-ResukiSU-*.zip \
+            --repo ${{ github.repository }} \
+            --title "ReSukiSU 内核 #${{ github.run_number }}" \
+            --generate-notes
