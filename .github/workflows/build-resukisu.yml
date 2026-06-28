@@ -57,6 +57,10 @@ jobs:
           # Copy updated Makefile and Kconfig
           cp -f Re-Kernel/LKM-Source/Makefile drivers/rekernel/
           cp -f Re-Kernel/LKM-Source/Kconfig drivers/rekernel/
+          # Build into kernel instead of module
+          sed -i "s/obj-m/obj-y/" drivers/rekernel/Makefile
+          sed -i "s/depends on MODULES//" drivers/rekernel/Kconfig
+          sed -i "s/default n/default y/" drivers/rekernel/Kconfig
 
       - name: Prepare ccache
         run: mkdir -p ~/.ccache
