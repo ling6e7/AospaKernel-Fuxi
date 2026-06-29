@@ -2,9 +2,7 @@ name: 构建 ReSukiSU 内核--无rekernel
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - AospaFuxi
+
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
