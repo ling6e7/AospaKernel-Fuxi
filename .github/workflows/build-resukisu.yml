@@ -45,21 +45,14 @@ jobs:
       - name: Setup Re:Kernel (with git for auto-update)
         run: |
           rm -rf Re-Kernel
-
-          git clone --depth=1 -b main https://github.com/myflavor/ReKernel-X.git Re-Kernel
+          git clone --depth=1 https://github.com/myflavor/ReKernel-X.git Re-Kernel
           mkdir -p drivers/rekernel
-          # Remove old single-file source if present
-          rm -f drivers/rekernel/rekernel.c
-          # Copy all new source files
-          cp -f Re-Kernel/LKM-Source/*.c drivers/rekernel/
-          cp -f Re-Kernel/LKM-Source/*.h drivers/rekernel/
-          # Copy updated Makefile and Kconfig
-          cp -f Re-Kernel/LKM-Source/Makefile drivers/rekernel/
-          cp -f Re-Kernel/LKM-Source/Kconfig drivers/rekernel/
-          # Build into kernel instead of module
-          sed -i "s/obj-m/obj-y/" drivers/rekernel/Makefile
-          sed -i "s/depends on MODULES//" drivers/rekernel/Kconfig
-          sed -i "s/default n/default y/" drivers/rekernel/Kconfig
+          cp -f Re-Kernel/LKM-Source/rekernel_x*.c drivers/rekernel/
+          cp -f Re-Kernel/LKM-Source/rekernel_x*.h drivers/rekernel/
+          # 生成适配内置编译的Makefile(多文件结构)
+          echo 'obj-$(CONFIG_REKERNEL) += rekernel_x.o' > drivers/rekernel/Makefile
+          echo 'rekernel_x-y := rekernel_x_main.o rekernel_x_genl.o rekernel_x_netuid.o rekernel_x_frozen.o rekernel_x_binder.o rekernel_x_signal.o rekernel_x_netfilter.o rekernel_x_binder_kp.o' >> drivers/rekernel/Makefile
+
 
 
       - name: Prepare ccache
