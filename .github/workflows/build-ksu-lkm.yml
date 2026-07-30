@@ -1,0 +1,398 @@
+name: 构建 KSU-LKM 内核
+
+# 目标: 管理器可升级 KSU (不必为升 KSU 重编整核)
+# - 内核: CONFIG_KSU=m → 产出 kernelsu.ko (不编进 Image)
+# - 管理器: ksud boot-patch -m kernelsu.ko 写入 boot/init_boot 后重启生效
+# - 不编 Re:Kernel; 不编全树 vendor modules
+# - 关 ThinLTO / 强制模块签名, 便于加载自编 .ko
+
+on:
+  workflow_dispatch:
+    inputs:
+      disable_lto:
+        description: '关闭 Clang ThinLTO'
+        required: false
+        default: true
+        type: boolean
+  push:
+    branches:
+      - LKM-Build
+      - KSU-LKM-Build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  LOCALVERSION: -AOSPA-KSULKM-BY@ling6e7
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+          submodules: false
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg libssl-dev libelf-dev \
+            cpio zip xz-utils wget python3 rsync kmod
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+          echo "CLANG_PATH=$(pwd)/bin" >> "$GITHUB_ENV"
+          ./bin/clang --version | head -3
+
+      - name: Resolve options
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            DISABLE_LTO='${{ inputs.disable_lto }}'
+          else
+            DISABLE_LTO=true
+          fi
+          : "${DISABLE_LTO:=true}"
+          echo "DISABLE_LTO=${DISABLE_LTO}" >> "$GITHUB_ENV"
+
+      - name: Setup ReSukiSU (for kernelsu.ko)
+        run: |
+          rm -rf KernelSU
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          rm -f drivers/kernelsu
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+          test -f drivers/kernelsu/Kconfig
+          test -f drivers/kernelsu/Kbuild || test -f drivers/kernelsu/Makefile
+          echo "KSU_HEAD=$(cd KernelSU && git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+          echo "KSU_TAG=$(cd KernelSU && git describe --abbrev=0 --tags 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
+
+      - name: Ensure Re:Kernel is NOT built
+        run: |
+          rm -rf Re-Kernel drivers/rekernel
+          mkdir -p drivers/rekernel
+          printf 'obj-y :=\n' > drivers/rekernel/Makefile
+          cat > drivers/rekernel/Kconfig <<'EOF'
+          menu "Re:Kernel (disabled)"
+          config REKERNEL
+          	bool
+          	default n
+          config REKERNEL_NETWORK
+          	bool
+          	default n
+          endmenu
+          EOF
+          DEF=arch/arm64/configs/fuxi_defconfig
+          sed -i \
+            -e '/^CONFIG_REKERNEL=/d' \
+            -e '/^CONFIG_REKERNEL_NETWORK=/d' \
+            -e '/^CONFIG_KSU=/d' \
+            -e '/^CONFIG_KSU_DEBUG=/d' \
+            -e '/^CONFIG_KSU_MULTI_MANAGER_SUPPORT=/d' \
+            -e '/^CONFIG_KSU_TRACEPOINT_HOOK=/d' \
+            -e '/^# CONFIG_KSU/d' \
+            "$DEF"
+          {
+            echo '# CONFIG_REKERNEL is not set'
+            echo '# CONFIG_REKERNEL_NETWORK is not set'
+            # KSU 以模块形式; 具体 =m 在 scripts/config 阶段设置
+            echo 'CONFIG_KSU=m'
+            echo 'CONFIG_KSU_MULTI_MANAGER_SUPPORT=y'
+            echo 'CONFIG_KSU_TRACEPOINT_HOOK=y'
+            echo '# CONFIG_KSU_MANUAL_HOOK is not set'
+            echo '# CONFIG_KSU_SUSFS is not set'
+            echo '# CONFIG_KSU_DEBUG is not set'
+          } >> "$DEF"
+
+      - name: Prepare ccache
+        run: mkdir -p ~/.ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-ksulkm-${{ github.ref_name }}-${{ github.run_number }}
+          restore-keys: |
+            ccache-ksulkm-${{ github.ref_name }}-
+            ccache-ksulkm-
+            ccache-lkm-
+
+      - name: Configure (KSU=m, LKM-ready)
+        run: |
+          set -euo pipefail
+          export ARCH=arm64 SUBARCH=arm64
+          export PATH="${CLANG_PATH}:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+          ccache -M 10G
+          ccache -z
+
+          MAKE=(make LLVM=1 LLVM_IAS=1 O=out "LOCALVERSION=${LOCALVERSION}")
+          "${MAKE[@]}" fuxi_defconfig -j"$(nproc)"
+
+          CFG=out/.config
+          sc() { scripts/config --file "$CFG" "$@"; }
+
+          sc --enable MODULES
+          sc --enable MODULE_UNLOAD
+          sc --enable MODULE_FORCE_UNLOAD || true
+          # arm64+KASLR 下开 MODVERSIONS 易链失败; 管理器自编 ko 也不依赖 CRC
+          sc --disable MODVERSIONS || true
+          sc --disable MODULE_REL_CRCS || true
+          sc --disable MODULE_SIG || true
+          sc --disable MODULE_SIG_ALL || true
+          sc --disable MODULE_SIG_FORCE || true
+          sc --disable MODULE_SIG_PROTECT || true
+          sc --disable TRIM_UNUSED_KSYMS || true
+
+          sc --enable KALLSYMS
+          sc --enable KALLSYMS_ALL || true
+          sc --enable IKCONFIG || true
+          sc --enable IKCONFIG_PROC || true
+          sc --enable KPROBES || true
+
+          if [ "${DISABLE_LTO}" != "false" ]; then
+            sc --disable LTO_CLANG_THIN || true
+            sc --disable LTO_CLANG_FULL || true
+            sc --disable LTO_CLANG || true
+            sc --enable LTO_NONE || true
+            echo "LTO=off" >> "$GITHUB_ENV"
+          else
+            echo "LTO=kept" >> "$GITHUB_ENV"
+          fi
+
+          sc --disable REKERNEL || true
+          sc --disable REKERNEL_NETWORK || true
+
+          # ---- KSU 模块化 (管理器可升级的核心) ----
+          # tristate: =m → kernelsu.ko, 不进 vmlinux
+          sc --module KSU
+          sc --enable KSU_MULTI_MANAGER_SUPPORT || true
+          sc --enable KSU_TRACEPOINT_HOOK || true
+          sc --disable KSU_MANUAL_HOOK || true
+          sc --disable KSU_SUSFS || true
+          sc --disable KSU_DEBUG || true
+
+          "${MAKE[@]}" olddefconfig
+
+          echo "======== KSU / module config ========"
+          grep -nE 'CONFIG_(MODULES|MODULE_|MODVERSIONS|LTO|KSU|REKERNEL|KALLSYMS|KPROBES)=' out/.config \
+            | grep -v RANDOMIZE_MODULE || true
+
+          grep -q '^CONFIG_MODULES=y$' out/.config
+          grep -q '^CONFIG_KSU=m$' out/.config
+          if grep -q '^CONFIG_KSU=y$' out/.config; then
+            echo "FATAL: KSU still builtin (=y), want =m" >&2
+            exit 1
+          fi
+          if grep -q '^CONFIG_REKERNEL=y$' out/.config; then
+            echo "FATAL: REKERNEL enabled" >&2
+            exit 1
+          fi
+          if grep -q '^CONFIG_MODVERSIONS=y$' out/.config && ! grep -q '^CONFIG_MODULE_REL_CRCS=y$' out/.config; then
+            echo "FATAL: MODVERSIONS without MODULE_REL_CRCS" >&2
+            exit 1
+          fi
+
+      - name: Build Image + kernelsu.ko only
+        run: |
+          set -euo pipefail
+          export ARCH=arm64 SUBARCH=arm64
+          export PATH="${CLANG_PATH}:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+
+          MAKE=(make LLVM=1 LLVM_IAS=1 O=out "LOCALVERSION=${LOCALVERSION}")
+          NPROC="$(nproc)"
+
+          # 1) 内核本体 (无 builtin KSU) + 外部模块编译准备
+          "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
+
+          test -f out/arch/arm64/boot/Image
+
+          # symvers: OOT / M= 需要
+          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
+            cp -f out/vmlinux.symvers out/Module.symvers
+          fi
+          if [ ! -f out/Module.symvers ]; then
+            "${MAKE[@]}" Module.symvers -j"$NPROC" 2>&1 | tee -a out/build.log || true
+          fi
+          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
+            cp -f out/vmlinux.symvers out/Module.symvers
+          fi
+          test -f out/Module.symvers
+
+          # 2) 只编 KernelSU 模块, 避免全树 =m 的 MODULE_LICENSE 灾难
+          # drivers/kernelsu → KernelSU/kernel
+          "${MAKE[@]}" M=drivers/kernelsu modules -j"$NPROC" 2>&1 | tee -a out/build.log
+
+          # 定位 kernelsu.ko
+          KO=""
+          for p in \
+            out/drivers/kernelsu/kernelsu.ko \
+            drivers/kernelsu/kernelsu.ko \
+            out/KernelSU/kernel/kernelsu.ko \
+            KernelSU/kernel/kernelsu.ko
+          do
+            if [ -f "$p" ]; then KO="$p"; break; fi
+          done
+          if [ -z "$KO" ]; then
+            echo "kernelsu.ko not found, searching..."
+            find out KernelSU drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null || true
+            find . -name 'kernelsu.ko' 2>/dev/null | head -20 || true
+            exit 1
+          fi
+          echo "Found KO=$KO"
+          cp -f "$KO" out/kernelsu.ko
+          file out/kernelsu.ko
+          modinfo out/kernelsu.ko || true
+
+          KERNELRELEASE="$("${MAKE[@]}" -s kernelrelease)"
+          echo "KERNELRELEASE=${KERNELRELEASE}" >> "$GITHUB_ENV"
+          echo "Kernel release: ${KERNELRELEASE}"
+          ccache -s || true
+
+      - name: Package flashable zip + KSU module
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u '+%Y%m%d-%H%M')"
+          ZIP_KERNEL="Fuxi-KSU-LKM-kernel-${STAMP}.zip"
+          ZIP_MOD="Fuxi-KSU-LKM-module-${STAMP}.zip"
+
+          test -f out/arch/arm64/boot/Image
+          test -f out/kernelsu.ko
+          test -d tools/AK3
+
+          rm -rf out/AK3
+          cp -a tools/AK3 out/AK3
+          cp -f out/arch/arm64/boot/Image out/AK3/Image
+          # 模块单独给管理器; 也可放进 zip 方便带走
+          cp -f out/kernelsu.ko out/AK3/kernelsu.ko
+          cat > out/AK3/KSU-LKM-README.txt <<EOF
+          Fuxi KSU-LKM kernel (manager-upgradable KSU)
+          ============================================
+          KERNELRELEASE=${KERNELRELEASE}
+          LOCALVERSION=${LOCALVERSION}
+          KSU: built as MODULE (CONFIG_KSU=m) — NOT builtin
+          ReSukiSU: ${KSU_TAG:-?} @ ${KSU_HEAD:-?}
+          LTO=${LTO:-?}
+          Commit: ${{ github.sha }}
+          Run: ${{ github.run_number }}
+
+          ## 这是什么
+          - Image: 不含 KSU 主体的内核
+          - kernelsu.ko: 可被 ReSukiSU/KernelSU 管理器安装/升级的模块
+
+          ## 首次使用 (有 root / 已能进系统时)
+          1. 刷本包 Image (AnyKernel3)
+          2. 打开 ReSukiSU/KernelSU 管理器
+          3. 安装/修补 boot 或 init_boot, 选择本包内 kernelsu.ko
+             (等价 CLI: ksud boot-patch -f -m kernelsu.ko)
+          4. 重启
+
+          ## 之后升级 KSU
+          - 管理器获取新版 kernelsu.ko (须用【同一内核树/配置】重编的 ko)
+          - 管理器再次 boot-patch 写入新 ko → 重启
+          - 无需重编/重刷整核 Image (除非内核本身变更)
+
+          ## 注意
+          - 官方 GKI 通用 ko 不能直接用在本定制核上
+          - vermagic 必须匹配 uname -r (= ${KERNELRELEASE})
+          - 升级需要重启; 不是运行时热替换
+          EOF
+
+          (
+            cd out/AK3
+            zip -r9 "../../${ZIP_KERNEL}" .
+          )
+
+          # 精简模块包 (管理器升级常用)
+          MODDIR=out/ksu-module-pkg
+          rm -rf "$MODDIR"
+          mkdir -p "$MODDIR"
+          cp -f out/kernelsu.ko "$MODDIR/"
+          cp -f out/Module.symvers "$MODDIR/" 2>/dev/null || true
+          cp -f out/.config "$MODDIR/config"
+          echo "${KERNELRELEASE}" > "$MODDIR/kernelrelease"
+          echo "${{ github.sha }}" > "$MODDIR/source-commit"
+          echo "${KSU_HEAD:-}" > "$MODDIR/resukisu-commit"
+          cp -f out/AK3/KSU-LKM-README.txt "$MODDIR/README.txt"
+          (
+            cd "$MODDIR"
+            zip -r9 "../../${ZIP_MOD}" .
+          )
+
+          ls -lh "${ZIP_KERNEL}" "${ZIP_MOD}" out/kernelsu.ko
+          echo "ZIP_KERNEL=${ZIP_KERNEL}" >> "$GITHUB_ENV"
+          echo "ZIP_MOD=${ZIP_MOD}" >> "$GITHUB_ENV"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Fuxi-KSU-LKM-${{ github.run_number }}
+          path: |
+            Fuxi-KSU-LKM-*.zip
+            out/kernelsu.ko
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload to Telegram (optional)
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          if [ -z "${TOKEN:-}" ] || [ -z "${CHAT_ID:-}" ]; then
+            echo "Telegram skipped"
+            exit 0
+          fi
+          NL=$'\n'
+          CAPTION="✅ Fuxi KSU-LKM (管理器可升级)${NL}✅ ${KERNELRELEASE}${NL}✅ KSU=m ${KSU_TAG}@${KSU_HEAD}${NL}✅ ReKernel OFF${NL}✅ LTO ${LTO:-?}${NL}#${{ github.run_number }}"
+          for f in ${ZIP_KERNEL} ${ZIP_MOD}; do
+            curl -s -F chat_id="$CHAT_ID" -F document=@"$f" -F "caption=$CAPTION" \
+              "https://api.telegram.org/bot${TOKEN}/sendDocument" >/dev/null || true
+          done
+
+      - name: Create GitHub Release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="KSU-LKM-${{ github.run_number }}"
+          NOTES=$(cat <<EOF
+          ## Fuxi KSU-LKM #${{ github.run_number }}
+
+          **管理器可升级 KSU**（\`CONFIG_KSU=m\` → \`kernelsu.ko\`）
+
+          | 项 | 值 |
+          |----|----|
+          | KERNELRELEASE | \`${KERNELRELEASE}\` |
+          | ReSukiSU | ${KSU_TAG} @ ${KSU_HEAD} |
+          | KSU | **module** (not builtin) |
+          | ReKernel | off |
+          | LTO | ${LTO} |
+          | Commit | ${{ github.sha }} |
+
+          ### 文件
+          - \`${ZIP_KERNEL}\` — AnyKernel3（Image + kernelsu.ko + 说明）
+          - \`${ZIP_MOD}\` — 仅模块包（升级用）
+
+          ### 使用
+          1. 刷 kernel zip
+          2. 管理器 boot-patch 选择 \`kernelsu.ko\`
+          3. 重启；以后升 KSU 只换 ko + patch boot，不重编整核
+
+          官方通用 GKI ko **不能**直接用于本定制核；ko 须针对本 kernelrelease 编译。
+          EOF
+          )
+          gh release create "$TAG" ${ZIP_KERNEL} ${ZIP_MOD} \
+            --repo "${{ github.repository }}" \
+            --title "KSU-LKM 内核 #${{ github.run_number }}" \
+            --notes "$NOTES" \
+            || gh release upload "$TAG" ${ZIP_KERNEL} ${ZIP_MOD} --repo "${{ github.repository }}" --clobber

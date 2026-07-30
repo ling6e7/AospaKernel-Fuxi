@@ -24,9 +24,10 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches:
-      - LKM-Build
+  # push disabled: superseded by build-ksu-lkm.yml (manager-upgradable KSU)
+  # push:
+  #   branches:
+  #     - LKM-Build
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
