@@ -208,7 +208,11 @@ jobs:
           sc --enable MODULES
           sc --enable MODULE_UNLOAD
           sc --enable MODULE_FORCE_UNLOAD || true
-          sc --enable MODVERSIONS || true
+          # MODVERSIONS 在 arm64+RANDOMIZE_BASE 下需要 MODULE_REL_CRCS,
+          # 且会提高 OOT .ko 对 CRC 的绑定; 任意 ko 加载场景默认关闭更稳.
+          # (曾 enable 导致 ld.lld R_AARCH64_ABS32 vs __crc_* 链接失败)
+          sc --disable MODVERSIONS || true
+          sc --disable MODULE_REL_CRCS || true
           # 不强制签名, 避免未签名 OOT 模块无法加载
           sc --disable MODULE_SIG || true
           sc --disable MODULE_SIG_ALL || true
@@ -260,8 +264,15 @@ jobs:
           "${MAKE[@]}" olddefconfig
 
           echo "======== final module-related config ========"
-          rg -n 'CONFIG_(MODULES|MODULE_|MODVERSIONS|LTO|TRIM_UNUSED|KALLSYMS|REKERNEL|KSU|IKCONFIG|IKHEADERS)=' out/.config \
-            | rg -v 'RANDOMIZE_MODULE' || true
+          grep -nE 'CONFIG_(MODULES|MODULE_|MODVERSIONS|LTO|TRIM_UNUSED|KALLSYMS|REKERNEL|KSU|IKCONFIG|IKHEADERS)=' out/.config \
+            | grep -v RANDOMIZE_MODULE || true
+          # 链接安全断言: 不可 MODVERSIONS=y 且无 MODULE_REL_CRCS (arm64 reloc)
+          if grep -q '^CONFIG_MODVERSIONS=y$' out/.config; then
+            if ! grep -q '^CONFIG_MODULE_REL_CRCS=y$' out/.config; then
+              echo "FATAL: CONFIG_MODVERSIONS=y without MODULE_REL_CRCS on relocatable arm64" >&2
+              exit 1
+            fi
+          fi
 
           # 硬性检查
           grep -q '^CONFIG_MODULES=y$' out/.config
