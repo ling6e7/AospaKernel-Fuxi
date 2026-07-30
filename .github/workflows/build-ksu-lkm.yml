@@ -67,12 +67,33 @@ jobs:
 
       - name: Setup ReSukiSU (for kernelsu.ko)
         run: |
+          set -euo pipefail
           rm -rf KernelSU
+          # 完整 git 元数据: ReSukiSU Kbuild 要求 kernel/../.git 存在
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          test -d KernelSU/.git
+          test -f KernelSU/kernel/Kconfig
+          test -f KernelSU/kernel/Kbuild
+          test -f KernelSU/kernel/core/init.c
+          grep -q 'MODULE_LICENSE("GPL")' KernelSU/kernel/core/init.c
+
+          # in-tree Kconfig 需要 drivers/kernelsu (defconfig / 菜单)
           rm -f drivers/kernelsu
-          ln -sf ../KernelSU/kernel drivers/kernelsu
+          ln -sfn ../KernelSU/kernel drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
-          test -f drivers/kernelsu/Kbuild || test -f drivers/kernelsu/Makefile
+
+          # 保险: 额外 modinfo 目标文件 (部分树对 composite .o 丢 .modinfo)
+          if ! grep -q 'ksu_modinfo.o' KernelSU/kernel/Kbuild; then
+            cat > KernelSU/kernel/ksu_modinfo.c <<'EOF'
+          #include <linux/module.h>
+          MODULE_LICENSE("GPL");
+          MODULE_AUTHOR("weishu");
+          MODULE_DESCRIPTION("Android KernelSU");
+          EOF
+            # 插到 kernelsu-objs 定义之后
+            sed -i '1a kernelsu-objs += ksu_modinfo.o' KernelSU/kernel/Kbuild
+          fi
+
           echo "KSU_HEAD=$(cd KernelSU && git rev-parse --short HEAD)" >> "$GITHUB_ENV"
           echo "KSU_TAG=$(cd KernelSU && git describe --abbrev=0 --tags 2>/dev/null || echo unknown)" >> "$GITHUB_ENV"
 
@@ -211,13 +232,18 @@ jobs:
 
           MAKE=(make LLVM=1 LLVM_IAS=1 O=out "LOCALVERSION=${LOCALVERSION}")
           NPROC="$(nproc)"
+          ROOT="$(pwd)"
+          KSU_SRC="${ROOT}/KernelSU/kernel"
 
           # 1) 内核本体 (无 builtin KSU) + 外部模块编译准备
           "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
 
           test -f out/arch/arm64/boot/Image
+          test -d "${KSU_SRC}"
+          test -f "${KSU_SRC}/core/init.c"
+          grep -q 'MODULE_LICENSE' "${KSU_SRC}/core/init.c"
 
-          # symvers: OOT / M= 需要
+          # symvers: OOT 需要完整导出表 (vmlinux.symvers 在 Image 后生成)
           if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
             cp -f out/vmlinux.symvers out/Module.symvers
           fi
@@ -228,31 +254,64 @@ jobs:
             cp -f out/vmlinux.symvers out/Module.symvers
           fi
           test -f out/Module.symvers
+          # 部分路径下 M= 读的是源码树根 Module.symvers
+          cp -f out/Module.symvers Module.symvers
+          cp -f out/Module.symvers "${KSU_SRC}/Module.symvers" 2>/dev/null || true
 
-          # 2) 只编 KernelSU 模块, 避免全树 =m 的 MODULE_LICENSE 灾难
-          # drivers/kernelsu → KernelSU/kernel
-          "${MAKE[@]}" M=drivers/kernelsu modules -j"$NPROC" 2>&1 | tee -a out/build.log
+          # 2) 按 ReSukiSU OOT 方式编 kernelsu.ko
+          # - 不要 make M=drivers/kernelsu：symlink 进树时 modinfo/符号解析易坏
+          # - KBUILD_MODPOST_WARN=1：KSU 大量非导出符号靠运行时 kallsyms 解析，
+          #   正式 GKI/DDK 路径同样不把这些当硬错误
+          # - 避免 make modules 全树 =m（vendor 缺 MODULE_LICENSE）
+          echo "==== Building kernelsu.ko (OOT from KernelSU/kernel) ===="
+          # 清掉可能残留的半成品
+          rm -f out/drivers/kernelsu/kernelsu.ko \
+                "${KSU_SRC}/kernelsu.ko" \
+                out/kernelsu.ko 2>/dev/null || true
+
+          set +e
+          "${MAKE[@]}" M="${KSU_SRC}" modules \
+            KBUILD_MODPOST_WARN=1 \
+            -j"$NPROC" 2>&1 | tee -a out/build.log
+          rc1=$?
+          set -e
+
+          # 回退：in-tree 单模块目标 (CONFIG_KSU=m)
+          if [ "$rc1" -ne 0 ] || ! find "${KSU_SRC}" out/drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null | grep -q .; then
+            echo "==== Fallback: in-tree drivers/kernelsu/kernelsu.ko ===="
+            "${MAKE[@]}" drivers/kernelsu/kernelsu.ko \
+              KBUILD_MODPOST_WARN=1 \
+              -j"$NPROC" 2>&1 | tee -a out/build.log
+          fi
 
           # 定位 kernelsu.ko
           KO=""
           for p in \
-            out/drivers/kernelsu/kernelsu.ko \
-            drivers/kernelsu/kernelsu.ko \
+            "${KSU_SRC}/kernelsu.ko" \
             out/KernelSU/kernel/kernelsu.ko \
-            KernelSU/kernel/kernelsu.ko
+            out/drivers/kernelsu/kernelsu.ko \
+            drivers/kernelsu/kernelsu.ko
           do
             if [ -f "$p" ]; then KO="$p"; break; fi
           done
           if [ -z "$KO" ]; then
+            KO="$(find out KernelSU drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null | head -1 || true)"
+          fi
+          if [ -z "${KO}" ] || [ ! -f "${KO}" ]; then
             echo "kernelsu.ko not found, searching..."
-            find out KernelSU drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null || true
+            find out KernelSU drivers -name 'kernelsu.ko' 2>/dev/null || true
             find . -name 'kernelsu.ko' 2>/dev/null | head -20 || true
+            # 仍失败时打印末尾 log 便于排障
+            tail -80 out/build.log || true
             exit 1
           fi
           echo "Found KO=$KO"
           cp -f "$KO" out/kernelsu.ko
           file out/kernelsu.ko
-          modinfo out/kernelsu.ko || true
+          modinfo out/kernelsu.ko
+          # 管理器/加载需要 license 与 vermagic
+          modinfo -F license out/kernelsu.ko | grep -qi gpl
+          modinfo -F vermagic out/kernelsu.ko
 
           KERNELRELEASE="$("${MAKE[@]}" -s kernelrelease)"
           echo "KERNELRELEASE=${KERNELRELEASE}" >> "$GITHUB_ENV"
