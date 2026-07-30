@@ -228,37 +228,9 @@ jobs:
             echo "FATAL: MODVERSIONS without MODULE_REL_CRCS" >&2
             exit 1
           fi
-
-          # 只保留 KSU 为 loadable module。原 CI 只出 Image, vendor =m 本就不打包;
-          # 全树 modules 会因缺 MODULE_LICENSE 在 modpost 爆炸。
-          echo "==== Demote all =m except KSU ===="
-          python3 <<'PY'
-          from pathlib import Path
-          p = Path("out/.config")
-          lines = p.read_text().splitlines()
-          out, n = [], 0
-          for line in lines:
-              if line.startswith("CONFIG_") and line.endswith("=m"):
-                  name = line[len("CONFIG_"):-len("=m")]
-                  if name != "KSU":
-                      out.append(f"# CONFIG_{name} is not set")
-                      n += 1
-                      continue
-              out.append(line)
-          p.write_text("\n".join(out) + "\n")
-          print(f"demoted {n} modules to n; kept CONFIG_KSU=m")
-          PY
-          sc --module KSU
-          sc --enable MODULES
-          "${MAKE[@]}" olddefconfig
-          echo "remaining =m:"
-          grep '=m$' out/.config || true
-          grep -q '^CONFIG_KSU=m$' out/.config
-          extra_m="$(grep '=m$' out/.config | grep -v '^CONFIG_KSU=m$' || true)"
-          if [ -n "$extra_m" ]; then
-            echo "WARN: extra modules still =m (will try build anyway):"
-            echo "$extra_m"
-          fi
+          # 不 demote 其它 =m、也不跑全树 modules:
+          # 全树 modules 会撞 techpack display (gh_irq_lend 重复符号) /
+          # vendor MODULE_LICENSE。只编 Image + M=drivers/kernelsu。
 
       - name: Build Image + kernelsu.ko only
         run: |
@@ -278,35 +250,45 @@ jobs:
 
           # 清旧模块产物, 强制重编 (避免复用无 .modinfo 的 .o)
           rm -rf out/drivers/kernelsu
-          find KernelSU/kernel -name '*.o' -o -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' \
-            -o -name '*.cmd' -o -name 'Module.symvers' 2>/dev/null | head -5 || true
-          find KernelSU/kernel \( -name '*.o' -o -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' \) -delete 2>/dev/null || true
+          find KernelSU/kernel \( -name '*.o' -o -name '*.ko' -o -name '*.mod' \
+            -o -name '*.mod.c' -o -name 'Module.symvers' \) -delete 2>/dev/null || true
 
-          # Image (无 builtin KSU) + in-tree modules (应仅 kernelsu.ko)
-          # KBUILD_MODPOST_WARN=1: 非导出符号由 KSU 运行时 kallsyms 解析
-          echo "==== make Image modules (KSU=m only) ===="
-          "${MAKE[@]}" Image modules \
-            KBUILD_MODPOST_WARN=1 \
-            -j"$NPROC" 2>&1 | tee out/build.log
-
+          # 1) 只编 Image + modules_prepare — 绝不 make modules (techpack/vendor 会炸)
+          echo "==== make Image modules_prepare ===="
+          "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
           test -f out/arch/arm64/boot/Image
 
-          # 若 in-tree 仍未产出 ko, 再试 OOT (带 WARN + 已注入的 raw .modinfo)
+          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
+            cp -f out/vmlinux.symvers out/Module.symvers
+          fi
+          if [ ! -f out/Module.symvers ]; then
+            "${MAKE[@]}" Module.symvers -j"$NPROC" 2>&1 | tee -a out/build.log || true
+          fi
+          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
+            cp -f out/vmlinux.symvers out/Module.symvers
+          fi
+          test -f out/Module.symvers
+          cp -f out/Module.symvers Module.symvers
+
+          # 2) 仅 KSU 模块 (in-tree symlink drivers/kernelsu → KernelSU/kernel)
+          # raw .modinfo 已注入; KBUILD_MODPOST_WARN=1 放行 kallsyms 运行时解析的符号
+          echo "==== make M=drivers/kernelsu modules ===="
+          "${MAKE[@]}" M=drivers/kernelsu modules \
+            KBUILD_MODPOST_WARN=1 \
+            -j"$NPROC" 2>&1 | tee -a out/build.log
+
           KO=""
           for p in \
             out/drivers/kernelsu/kernelsu.ko \
             drivers/kernelsu/kernelsu.ko \
-            "${KSU_SRC}/kernelsu.ko"
+            "${KSU_SRC}/kernelsu.ko" \
+            out/KernelSU/kernel/kernelsu.ko
           do
             if [ -f "$p" ]; then KO="$p"; break; fi
           done
 
           if [ -z "${KO}" ]; then
-            echo "==== Fallback OOT M=KernelSU/kernel ===="
-            if [ -f out/vmlinux.symvers ] && [ ! -f out/Module.symvers ]; then
-              cp -f out/vmlinux.symvers out/Module.symvers
-            fi
-            cp -f out/Module.symvers Module.symvers 2>/dev/null || true
+            echo "==== Fallback M=KernelSU/kernel ===="
             "${MAKE[@]}" M="${KSU_SRC}" modules \
               KBUILD_MODPOST_WARN=1 \
               -j"$NPROC" 2>&1 | tee -a out/build.log
@@ -317,28 +299,24 @@ jobs:
 
           if [ -z "${KO}" ] || [ ! -f "${KO}" ]; then
             echo "kernelsu.ko not found"
-            find out KernelSU drivers -name 'kernelsu.ko' 2>/dev/null || true
-            # 诊断: composite .o 是否含 license= 字符串
+            find out KernelSU drivers -name 'kernelsu*' 2>/dev/null | head -40 || true
             find out/drivers/kernelsu KernelSU/kernel -name 'kernelsu.o' 2>/dev/null | while read -r o; do
               echo "--- strings $o (modinfo) ---"
               strings "$o" | grep -E '^(license|author|description)=' || true
             done
-            tail -100 out/build.log || true
+            tail -120 out/build.log || true
             exit 1
           fi
 
           echo "Found KO=$KO"
           cp -f "$KO" out/kernelsu.ko
           file out/kernelsu.ko
+          # 诊断 .modinfo 是否进了最终 ko
+          strings out/kernelsu.ko | grep -E '^(license|vermagic|description)=' || true
           modinfo out/kernelsu.ko
           modinfo -F license out/kernelsu.ko | grep -qi gpl
           modinfo -F vermagic out/kernelsu.ko
-          # 可选 strip 调试符 (管理器包更小)
           llvm-strip -d out/kernelsu.ko 2>/dev/null || true
-
-          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
-            cp -f out/vmlinux.symvers out/Module.symvers
-          fi
 
           KERNELRELEASE="$("${MAKE[@]}" -s kernelrelease)"
           echo "KERNELRELEASE=${KERNELRELEASE}" >> "$GITHUB_ENV"
