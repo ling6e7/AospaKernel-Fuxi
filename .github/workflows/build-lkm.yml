@@ -361,7 +361,7 @@ jobs:
 
           static int __init hello_init(void)
           {
-          	pr_info("lkm_hello: loaded on %s\n", UTS_RELEASE);
+          	pr_info("lkm_hello: loaded\n");
           	return 0;
           }
           static void __exit hello_exit(void)
