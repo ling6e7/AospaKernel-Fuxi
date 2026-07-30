@@ -64,15 +64,84 @@ jobs:
           echo "CLANG_PATH=$(pwd)/bin" >> "$GITHUB_ENV"
           ./bin/clang --version | head -3
 
+      # push 事件下 inputs.* 为空; 默认 keep_ksu=true
+      - name: Resolve build options
+        run: |
+          # workflow_dispatch 用 inputs; push 用默认值
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            KEEP_KSU='${{ inputs.keep_ksu }}'
+            DISABLE_LTO='${{ inputs.disable_lto }}'
+            BUILD_TREE_MODULES='${{ inputs.build_tree_modules }}'
+          else
+            KEEP_KSU=true
+            DISABLE_LTO=true
+            BUILD_TREE_MODULES=true
+          fi
+          # 规范化空值
+          : "${KEEP_KSU:=true}"
+          : "${DISABLE_LTO:=true}"
+          : "${BUILD_TREE_MODULES:=true}"
+          {
+            echo "KEEP_KSU=${KEEP_KSU}"
+            echo "DISABLE_LTO=${DISABLE_LTO}"
+            echo "BUILD_TREE_MODULES=${BUILD_TREE_MODULES}"
+          } >> "$GITHUB_ENV"
+          echo "options: KEEP_KSU=${KEEP_KSU} DISABLE_LTO=${DISABLE_LTO} BUILD_TREE_MODULES=${BUILD_TREE_MODULES}"
+
       - name: Setup ReSukiSU (optional)
-        if: ${{ inputs.keep_ksu != false }}
+        if: ${{ env.KEEP_KSU != 'false' }}
         run: |
           rm -rf KernelSU
           git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
           rm -f drivers/kernelsu
           ln -sf ../KernelSU/kernel drivers/kernelsu
+          # 确保 Kconfig 存在 (drivers/Kconfig source 它)
+          if [ ! -f drivers/kernelsu/Kconfig ]; then
+            echo "drivers/kernelsu/Kconfig missing after clone" >&2
+            ls -la KernelSU/kernel || true
+            exit 1
+          fi
           echo "KSU_ENABLED=1" >> "$GITHUB_ENV"
           echo "KSU_HEAD=$(cd KernelSU && git rev-parse --short HEAD)" >> "$GITHUB_ENV"
+
+      - name: Stub KernelSU if not vendored
+        # keep_ksu=false 或 setup 失败/跳过时, 避免 fuxi_defconfig 因缺 Kconfig 失败
+        run: |
+          if [ -e drivers/kernelsu/Kconfig ] || [ -L drivers/kernelsu ]; then
+            echo "KernelSU present, skip stub"
+            exit 0
+          fi
+          echo "Stubbing drivers/kernelsu (KSU disabled / not vendored)"
+          rm -rf drivers/kernelsu
+          mkdir -p drivers/kernelsu
+          printf 'obj-y :=\n' > drivers/kernelsu/Makefile
+          cat > drivers/kernelsu/Kconfig <<'EOF'
+          menu "KernelSU (disabled for this LKM build)"
+          config KSU
+          	bool "KernelSU"
+          	default n
+          config KSU_DEBUG
+          	bool
+          	depends on KSU
+          	default n
+          config KSU_MULTI_MANAGER_SUPPORT
+          	bool
+          	depends on KSU
+          	default n
+          endmenu
+          EOF
+          DEF=arch/arm64/configs/fuxi_defconfig
+          sed -i \
+            -e '/^CONFIG_KSU=/d' \
+            -e '/^CONFIG_KSU_DEBUG=/d' \
+            -e '/^CONFIG_KSU_MULTI_MANAGER_SUPPORT=/d' \
+            "$DEF"
+          {
+            echo '# CONFIG_KSU is not set'
+            echo '# CONFIG_KSU_DEBUG is not set'
+            echo '# CONFIG_KSU_MULTI_MANAGER_SUPPORT is not set'
+          } >> "$DEF"
+          echo "KSU_ENABLED=0" >> "$GITHUB_ENV"
 
       - name: Ensure Re:Kernel is NOT built-in
         run: |
@@ -156,7 +225,8 @@ jobs:
           sc --enable IKHEADERS || true
 
           # ---- 关闭 ThinLTO: OOT 模块与内核 ABI/编译一致性更稳 ----
-          if [ "${{ inputs.disable_lto }}" != "false" ]; then
+          # 使用 Resolve build options 写入的 DISABLE_LTO (push 安全)
+          if [ "${DISABLE_LTO:-true}" != "false" ]; then
             sc --disable LTO_CLANG_THIN || true
             sc --disable LTO_CLANG_FULL || true
             sc --disable LTO_CLANG || true
@@ -170,20 +240,20 @@ jobs:
           sc --disable REKERNEL || true
           sc --disable REKERNEL_NETWORK || true
 
-          # ---- KSU 可选 ----
-          if [ "${{ inputs.keep_ksu }}" = "false" ]; then
+          # ---- KSU 可选 (KEEP_KSU 来自 env) ----
+          if [ "${KEEP_KSU:-true}" = "false" ] || [ ! -e drivers/kernelsu/Kconfig ]; then
             sc --disable KSU || true
             sc --disable KSU_DEBUG || true
             sc --disable KSU_MULTI_MANAGER_SUPPORT || true
             echo "KSU_ENABLED=0" >> "$GITHUB_ENV"
           else
-            # keep_ksu 默认 true; 若未 setup 则 defconfig 可能仍有 KSU=y 但无源码
-            if [ ! -e drivers/kernelsu ]; then
-              sc --disable KSU || true
-              echo "KSU_ENABLED=0" >> "$GITHUB_ENV"
-            else
+            # 真实 KSU 树: 启用; stub 只有 default n 的 KSU
+            if [ -L drivers/kernelsu ] || [ -d KernelSU ]; then
               sc --enable KSU || true
               echo "KSU_ENABLED=1" >> "$GITHUB_ENV"
+            else
+              sc --disable KSU || true
+              echo "KSU_ENABLED=0" >> "$GITHUB_ENV"
             fi
           fi
 
@@ -218,7 +288,8 @@ jobs:
           NPROC="$(nproc)"
 
           # Image 必须有; modules 让 Module.symvers 覆盖树内导出
-          if [ "${{ inputs.build_tree_modules }}" != "false" ]; then
+          # BUILD_TREE_MODULES 来自 Resolve build options (push 默认 true)
+          if [ "${BUILD_TREE_MODULES:-true}" != "false" ]; then
             "${MAKE[@]}" Image modules -j"$NPROC" 2>&1 | tee out/build.log
           else
             # 至少 modules_prepare + vmlinux/Image, 便于外部 M= 编译
@@ -341,7 +412,7 @@ jobs:
             cp -a out/lkm-smoke "$DEV/"
           fi
           # 树内 .ko 若有, 附带一份清单 (不是刷机必需)
-          if [ "${{ inputs.build_tree_modules }}" != "false" ]; then
+          if [ "${BUILD_TREE_MODULES:-true}" != "false" ]; then
             mkdir -p "$DEV/tree-modules"
             find out -name '*.ko' -type f | head -5 | while read -r k; do
               echo "sample: $k"
