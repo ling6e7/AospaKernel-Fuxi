@@ -82,16 +82,22 @@ jobs:
           ln -sfn ../KernelSU/kernel drivers/kernelsu
           test -f drivers/kernelsu/Kconfig
 
-          # 保险: 额外 modinfo 目标文件 (部分树对 composite .o 丢 .modinfo)
-          if ! grep -q 'ksu_modinfo.o' KernelSU/kernel/Kbuild; then
-            cat > KernelSU/kernel/ksu_modinfo.c <<'EOF'
-          #include <linux/module.h>
-          MODULE_LICENSE("GPL");
-          MODULE_AUTHOR("weishu");
-          MODULE_DESCRIPTION("Android KernelSU");
+          # 直接写 .modinfo 段 (不依赖 -DMODULE 宏; MODULE_LICENSE 在无 -DMODULE 时是空操作)
+          # 复合 kernelsu-objs ld -r 时若带 --gc-sections 也可能丢 .modinfo → 关 gc + used section
+          cat > KernelSU/kernel/ksu_modinfo.c <<'EOF'
+          /* Emitting .modinfo without MODULE_* macros (works even if -DMODULE missing). */
+          __attribute__((section(".modinfo"), used, aligned(1)))
+          char __ksu_modinfo_license[] = "license=GPL";
+          __attribute__((section(".modinfo"), used, aligned(1)))
+          char __ksu_modinfo_author[] = "author=weishu";
+          __attribute__((section(".modinfo"), used, aligned(1)))
+          char __ksu_modinfo_descr[] = "description=Android KernelSU (LKM)";
           EOF
-            # 插到 kernelsu-objs 定义之后
+          if ! grep -q 'ksu_modinfo.o' KernelSU/kernel/Kbuild; then
             sed -i '1a kernelsu-objs += ksu_modinfo.o' KernelSU/kernel/Kbuild
+          fi
+          if ! grep -q 'LDFLAGS_kernelsu.o' KernelSU/kernel/Kbuild; then
+            printf '\n# Keep .modinfo through multi-obj partial link (lld --gc-sections)\nLDFLAGS_kernelsu.o := --no-gc-sections\n' >> KernelSU/kernel/Kbuild
           fi
 
           echo "KSU_HEAD=$(cd KernelSU && git rev-parse --short HEAD)" >> "$GITHUB_ENV"
@@ -223,6 +229,37 @@ jobs:
             exit 1
           fi
 
+          # 只保留 KSU 为 loadable module。原 CI 只出 Image, vendor =m 本就不打包;
+          # 全树 modules 会因缺 MODULE_LICENSE 在 modpost 爆炸。
+          echo "==== Demote all =m except KSU ===="
+          python3 <<'PY'
+          from pathlib import Path
+          p = Path("out/.config")
+          lines = p.read_text().splitlines()
+          out, n = [], 0
+          for line in lines:
+              if line.startswith("CONFIG_") and line.endswith("=m"):
+                  name = line[len("CONFIG_"):-len("=m")]
+                  if name != "KSU":
+                      out.append(f"# CONFIG_{name} is not set")
+                      n += 1
+                      continue
+              out.append(line)
+          p.write_text("\n".join(out) + "\n")
+          print(f"demoted {n} modules to n; kept CONFIG_KSU=m")
+          PY
+          sc --module KSU
+          sc --enable MODULES
+          "${MAKE[@]}" olddefconfig
+          echo "remaining =m:"
+          grep '=m$' out/.config || true
+          grep -q '^CONFIG_KSU=m$' out/.config
+          extra_m="$(grep '=m$' out/.config | grep -v '^CONFIG_KSU=m$' || true)"
+          if [ -n "$extra_m" ]; then
+            echo "WARN: extra modules still =m (will try build anyway):"
+            echo "$extra_m"
+          fi
+
       - name: Build Image + kernelsu.ko only
         run: |
           set -euo pipefail
@@ -235,83 +272,73 @@ jobs:
           ROOT="$(pwd)"
           KSU_SRC="${ROOT}/KernelSU/kernel"
 
-          # 1) 内核本体 (无 builtin KSU) + 外部模块编译准备
-          "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
+          test -d "${KSU_SRC}"
+          test -f "${KSU_SRC}/ksu_modinfo.c"
+          test -f drivers/kernelsu/Kconfig
+
+          # 清旧模块产物, 强制重编 (避免复用无 .modinfo 的 .o)
+          rm -rf out/drivers/kernelsu
+          find KernelSU/kernel -name '*.o' -o -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' \
+            -o -name '*.cmd' -o -name 'Module.symvers' 2>/dev/null | head -5 || true
+          find KernelSU/kernel \( -name '*.o' -o -name '*.ko' -o -name '*.mod' -o -name '*.mod.c' \) -delete 2>/dev/null || true
+
+          # Image (无 builtin KSU) + in-tree modules (应仅 kernelsu.ko)
+          # KBUILD_MODPOST_WARN=1: 非导出符号由 KSU 运行时 kallsyms 解析
+          echo "==== make Image modules (KSU=m only) ===="
+          "${MAKE[@]}" Image modules \
+            KBUILD_MODPOST_WARN=1 \
+            -j"$NPROC" 2>&1 | tee out/build.log
 
           test -f out/arch/arm64/boot/Image
-          test -d "${KSU_SRC}"
-          test -f "${KSU_SRC}/core/init.c"
-          grep -q 'MODULE_LICENSE' "${KSU_SRC}/core/init.c"
 
-          # symvers: OOT 需要完整导出表 (vmlinux.symvers 在 Image 后生成)
-          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
-            cp -f out/vmlinux.symvers out/Module.symvers
-          fi
-          if [ ! -f out/Module.symvers ]; then
-            "${MAKE[@]}" Module.symvers -j"$NPROC" 2>&1 | tee -a out/build.log || true
-          fi
-          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
-            cp -f out/vmlinux.symvers out/Module.symvers
-          fi
-          test -f out/Module.symvers
-          # 部分路径下 M= 读的是源码树根 Module.symvers
-          cp -f out/Module.symvers Module.symvers
-          cp -f out/Module.symvers "${KSU_SRC}/Module.symvers" 2>/dev/null || true
-
-          # 2) 按 ReSukiSU OOT 方式编 kernelsu.ko
-          # - 不要 make M=drivers/kernelsu：symlink 进树时 modinfo/符号解析易坏
-          # - KBUILD_MODPOST_WARN=1：KSU 大量非导出符号靠运行时 kallsyms 解析，
-          #   正式 GKI/DDK 路径同样不把这些当硬错误
-          # - 避免 make modules 全树 =m（vendor 缺 MODULE_LICENSE）
-          echo "==== Building kernelsu.ko (OOT from KernelSU/kernel) ===="
-          # 清掉可能残留的半成品
-          rm -f out/drivers/kernelsu/kernelsu.ko \
-                "${KSU_SRC}/kernelsu.ko" \
-                out/kernelsu.ko 2>/dev/null || true
-
-          set +e
-          "${MAKE[@]}" M="${KSU_SRC}" modules \
-            KBUILD_MODPOST_WARN=1 \
-            -j"$NPROC" 2>&1 | tee -a out/build.log
-          rc1=$?
-          set -e
-
-          # 回退：in-tree 单模块目标 (CONFIG_KSU=m)
-          if [ "$rc1" -ne 0 ] || ! find "${KSU_SRC}" out/drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null | grep -q .; then
-            echo "==== Fallback: in-tree drivers/kernelsu/kernelsu.ko ===="
-            "${MAKE[@]}" drivers/kernelsu/kernelsu.ko \
-              KBUILD_MODPOST_WARN=1 \
-              -j"$NPROC" 2>&1 | tee -a out/build.log
-          fi
-
-          # 定位 kernelsu.ko
+          # 若 in-tree 仍未产出 ko, 再试 OOT (带 WARN + 已注入的 raw .modinfo)
           KO=""
           for p in \
-            "${KSU_SRC}/kernelsu.ko" \
-            out/KernelSU/kernel/kernelsu.ko \
             out/drivers/kernelsu/kernelsu.ko \
-            drivers/kernelsu/kernelsu.ko
+            drivers/kernelsu/kernelsu.ko \
+            "${KSU_SRC}/kernelsu.ko"
           do
             if [ -f "$p" ]; then KO="$p"; break; fi
           done
-          if [ -z "$KO" ]; then
-            KO="$(find out KernelSU drivers/kernelsu -name 'kernelsu.ko' 2>/dev/null | head -1 || true)"
+
+          if [ -z "${KO}" ]; then
+            echo "==== Fallback OOT M=KernelSU/kernel ===="
+            if [ -f out/vmlinux.symvers ] && [ ! -f out/Module.symvers ]; then
+              cp -f out/vmlinux.symvers out/Module.symvers
+            fi
+            cp -f out/Module.symvers Module.symvers 2>/dev/null || true
+            "${MAKE[@]}" M="${KSU_SRC}" modules \
+              KBUILD_MODPOST_WARN=1 \
+              -j"$NPROC" 2>&1 | tee -a out/build.log
+            for p in "${KSU_SRC}/kernelsu.ko" out/KernelSU/kernel/kernelsu.ko; do
+              if [ -f "$p" ]; then KO="$p"; break; fi
+            done
           fi
+
           if [ -z "${KO}" ] || [ ! -f "${KO}" ]; then
-            echo "kernelsu.ko not found, searching..."
+            echo "kernelsu.ko not found"
             find out KernelSU drivers -name 'kernelsu.ko' 2>/dev/null || true
-            find . -name 'kernelsu.ko' 2>/dev/null | head -20 || true
-            # 仍失败时打印末尾 log 便于排障
-            tail -80 out/build.log || true
+            # 诊断: composite .o 是否含 license= 字符串
+            find out/drivers/kernelsu KernelSU/kernel -name 'kernelsu.o' 2>/dev/null | while read -r o; do
+              echo "--- strings $o (modinfo) ---"
+              strings "$o" | grep -E '^(license|author|description)=' || true
+            done
+            tail -100 out/build.log || true
             exit 1
           fi
+
           echo "Found KO=$KO"
           cp -f "$KO" out/kernelsu.ko
           file out/kernelsu.ko
           modinfo out/kernelsu.ko
-          # 管理器/加载需要 license 与 vermagic
           modinfo -F license out/kernelsu.ko | grep -qi gpl
           modinfo -F vermagic out/kernelsu.ko
+          # 可选 strip 调试符 (管理器包更小)
+          llvm-strip -d out/kernelsu.ko 2>/dev/null || true
+
+          if [ ! -f out/Module.symvers ] && [ -f out/vmlinux.symvers ]; then
+            cp -f out/vmlinux.symvers out/Module.symvers
+          fi
 
           KERNELRELEASE="$("${MAKE[@]}" -s kernelrelease)"
           echo "KERNELRELEASE=${KERNELRELEASE}" >> "$GITHUB_ENV"
