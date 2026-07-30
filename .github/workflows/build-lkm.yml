@@ -20,9 +20,9 @@ on:
         default: true
         type: boolean
       build_tree_modules:
-        description: '同时编译树内 =m 模块 (更完整 Module.symvers, 更慢)'
+        description: '尝试编译树内 =m 模块 (vendor 常缺 MODULE_LICENSE, 失败不阻断; 默认关)'
         required: false
-        default: true
+        default: false
         type: boolean
   push:
     branches:
@@ -75,12 +75,14 @@ jobs:
           else
             KEEP_KSU=true
             DISABLE_LTO=true
-            BUILD_TREE_MODULES=true
+            # 树内 =m 大量缺 MODULE_LICENSE, 全量 modules 会在 modpost 挂掉;
+            # OOT LKM 只需要 Image + modules_prepare + symvers
+            BUILD_TREE_MODULES=false
           fi
           # 规范化空值
           : "${KEEP_KSU:=true}"
           : "${DISABLE_LTO:=true}"
-          : "${BUILD_TREE_MODULES:=true}"
+          : "${BUILD_TREE_MODULES:=false}"
           {
             echo "KEEP_KSU=${KEEP_KSU}"
             echo "DISABLE_LTO=${DISABLE_LTO}"
@@ -287,7 +289,7 @@ jobs:
             exit 1
           fi
 
-      - name: Build Image (+ tree modules)
+      - name: Build Image (+ OOT module prep)
         run: |
           set -euo pipefail
           export ARCH=arm64
@@ -298,24 +300,49 @@ jobs:
           MAKE=(make LLVM=1 LLVM_IAS=1 O=out "LOCALVERSION=${LOCALVERSION}")
           NPROC="$(nproc)"
 
-          # Image 必须有; modules 让 Module.symvers 覆盖树内导出
-          # BUILD_TREE_MODULES 来自 Resolve build options (push 默认 true)
-          if [ "${BUILD_TREE_MODULES:-true}" != "false" ]; then
-            "${MAKE[@]}" Image modules -j"$NPROC" 2>&1 | tee out/build.log
-          else
-            # 至少 modules_prepare + vmlinux/Image, 便于外部 M= 编译
-            "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
-            # 再链一次确保 Module.symvers 生成
-            "${MAKE[@]}" Module.symvers -j"$NPROC" 2>&1 | tee -a out/build.log || true
+          # 核心: Image + modules_prepare (任意 out-of-tree M= 所需)
+          # 不要默认 make modules: 树内 =m 大量缺 MODULE_LICENSE, modpost 必挂
+          "${MAKE[@]}" Image modules_prepare -j"$NPROC" 2>&1 | tee out/build.log
+
+          # 确保有可供 OOT 使用的 symvers
+          if [ ! -f out/Module.symvers ]; then
+            if [ -f out/vmlinux.symvers ]; then
+              cp -f out/vmlinux.symvers out/Module.symvers
+              echo "Module.symvers <- vmlinux.symvers"
+            elif [ -f out/modules-only.symvers ]; then
+              cp -f out/modules-only.symvers out/Module.symvers
+              echo "Module.symvers <- modules-only.symvers"
+            else
+              # 再试一次显式生成
+              "${MAKE[@]}" Module.symvers -j"$NPROC" 2>&1 | tee -a out/build.log || true
+            fi
+          fi
+
+          # 可选: 树内 modules 尽力而为, 失败不阻断 (仅丰富导出符号)
+          if [ "${BUILD_TREE_MODULES:-false}" = "true" ]; then
+            set +e
+            "${MAKE[@]}" modules -j"$NPROC" 2>&1 | tee -a out/build.log
+            mod_rc=$?
+            set -e
+            if [ "$mod_rc" -ne 0 ]; then
+              echo "WARN: in-tree modules failed (often MODULE_LICENSE/modpost); Image kept"
+            else
+              echo "in-tree modules OK"
+            fi
           fi
 
           test -f out/arch/arm64/boot/Image
-          test -f out/Module.symvers
+          if [ ! -f out/Module.symvers ]; then
+            echo "FATAL: no Module.symvers / vmlinux.symvers for OOT builds" >&2
+            ls -la out/*.symvers out/Module.symvers 2>/dev/null || true
+            exit 1
+          fi
           ccache -s || true
 
           KERNELRELEASE="$("${MAKE[@]}" -s kernelrelease)"
           echo "KERNELRELEASE=${KERNELRELEASE}" >> "$GITHUB_ENV"
           echo "Kernel release: ${KERNELRELEASE}"
+          echo "BUILD_TREE_MODULES=${BUILD_TREE_MODULES:-false}" >> "$GITHUB_ENV"
 
       - name: Smoke-test out-of-tree hello.ko
         run: |
@@ -422,16 +449,12 @@ jobs:
           if [ -d out/lkm-smoke ]; then
             cp -a out/lkm-smoke "$DEV/"
           fi
-          # 树内 .ko 若有, 附带一份清单 (不是刷机必需)
-          if [ "${BUILD_TREE_MODULES:-true}" != "false" ]; then
-            mkdir -p "$DEV/tree-modules"
-            find out -name '*.ko' -type f | head -5 | while read -r k; do
-              echo "sample: $k"
-            done
-            find out -name '*.ko' -type f > "$DEV/tree-modules/modules.list" || true
-            KO_COUNT="$(wc -l < "$DEV/tree-modules/modules.list" | tr -d ' ')"
-            echo "tree_ko_count=${KO_COUNT}" | tee "$DEV/tree-modules/count.txt"
-          fi
+          # 树内 .ko 若有, 附带一份清单 (不是刷机必需; 默认不编树内 modules)
+          mkdir -p "$DEV/tree-modules"
+          find out -name '*.ko' -type f > "$DEV/tree-modules/modules.list" 2>/dev/null || true
+          KO_COUNT="$(wc -l < "$DEV/tree-modules/modules.list" | tr -d ' ' || echo 0)"
+          echo "tree_ko_count=${KO_COUNT}" | tee "$DEV/tree-modules/count.txt"
+          head -5 "$DEV/tree-modules/modules.list" 2>/dev/null || true
 
           cat > "$DEV/README-LKM.md" <<EOF
           # Fuxi LKM Devkit
