@@ -191,7 +191,7 @@ jobs:
       - name: Create Release
         if: success()
         run: |
-          GH_TOKEN=${{ github.token }} gh release create ReSukiSU-Build-${{ github.run_number }} Fuxi-ReSukiSU-*.zip \
+          GH_TOKEN=${{ github.token }} gh release create ReSukiSU-RKX11-Build-${{ github.run_number }} Fuxi-ReSukiSU-*.zip \
             --repo ${{ github.repository }} \
-            --title "ReSukiSU 内核 #${{ github.run_number }}" \
+            --title "ReSukiSU 内核 (RKX 1.1) #${{ github.run_number }}" \
             --generate-notes
