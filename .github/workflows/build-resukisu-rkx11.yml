@@ -1,0 +1,197 @@
+name: 构建 ReSukiSU 内核 (ReKernel-X 1.1)
+
+on:
+  workflow_dispatch:
+    inputs:
+      hook_type:
+        description: '钩子类型'
+        required: false
+        default: linehook
+        type: choice
+        options:
+          - Tracepoint
+          - linehook
+  push:
+    branches:
+      - ReKernel11-Build
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 1
+
+      - name: Install dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y \
+            bc bison build-essential ccache curl flex g++-multilib \
+            gcc-multilib git gnupg libssl-dev libelf-dev \
+            cpio zip xz-utils wget python3
+
+      - name: Setup Neutron Clang
+        run: |
+          mkdir -p toolchains/clang
+          cd toolchains/clang
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      - name: Setup ReSukiSU
+        run: |
+          rm -rf KernelSU
+          git clone --depth=1 https://github.com/ReSukiSU/ReSukiSU.git KernelSU
+          rm -f drivers/kernelsu
+          ln -sf ../KernelSU/kernel drivers/kernelsu
+
+      - name: Setup Re:Kernel-X 1.1 (pinned commit)
+        run: |
+          rm -rf Re-Kernel
+          RKX_COMMIT=fdce415dd3ac2b1aeeea82322458c5f84a6d4485
+          # 优先取 myflavor 上游的 1.2 tag; 若 tag 被删除则回退到 Sakion-Team 固定 commit
+          if git ls-remote --tags https://github.com/myflavor/ReKernel-X.git | grep -q 'refs/tags/1.2$'; then
+            git clone --depth=1 --branch 1.1 https://github.com/myflavor/ReKernel-X.git Re-Kernel
+          else
+            git clone --depth=1 https://github.com/Sakion-Team/Re-Kernel.git Re-Kernel
+            git -C Re-Kernel fetch --depth=1 origin $RKX_COMMIT
+            git -C Re-Kernel checkout $RKX_COMMIT
+          fi
+          mkdir -p drivers/rekernel
+          cp -f Re-Kernel/LKM-Source/rkx*.c drivers/rekernel/
+          cp -f Re-Kernel/LKM-Source/rkx*.h drivers/rekernel/
+          RKX_VER=1.1
+          echo "RKX_VER=${RKX_VER}" >> $GITHUB_ENV
+          sed 's/obj-m/obj-$(CONFIG_REKERNEL)/' Re-Kernel/LKM-Source/Makefile > drivers/rekernel/Makefile
+          echo "ccflags-y += -DRKX_VERSION=\\\"r${RKX_VER}\\\"" >> drivers/rekernel/Makefile
+
+      - name: Setup SUSFS (optional)
+        if: inputs.hook_type == 'linehook'
+        run: |
+          git clone --depth=1 -b gki-android13-5.15 https://gitlab.com/simonpunk/susfs4ksu.git susfs4ksu
+          cp susfs4ksu/kernel_patches/50_add_susfs_in_gki-android13-5.15.patch ./
+          cp -r susfs4ksu/kernel_patches/fs/* ./fs/
+          cp -r susfs4ksu/kernel_patches/include/* ./include/
+          patch -p1 < 50_add_susfs_in_gki-android13-5.15.patch
+          echo '# CONFIG_KSU_TRACEPOINT_HOOK is not set' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SUS_PATH=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SUS_MOUNT=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SUS_KSTAT=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SPOOF_UNAME=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_ENABLE_LOG=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_OPEN_REDIRECT=y' >> arch/arm64/configs/fuxi_defconfig
+          echo 'CONFIG_KSU_SUSFS_SUS_MAP=y' >> arch/arm64/configs/fuxi_defconfig
+
+      - name: Prepare ccache
+        run: mkdir -p ~/.ccache
+
+      - name: Restore ccache
+        uses: actions/cache@v5
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.ref_name }}
+          restore-keys: ccache-
+
+      - name: Build kernel (defconfig)
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/toolchains/clang/bin:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+          ccache -M 8G
+          make LLVM=1 LLVM_IAS=1 O=out LOCALVERSION=-AOSPA-BY@Samrtin fuxi_defconfig -j$(nproc --all)
+          make LLVM=1 LLVM_IAS=1 O=out olddefconfig 2>&1 | tail -3
+
+      - name: Fix SUSFS hook mode (override olddefconfig default)
+        if: inputs.hook_type == 'linehook'
+        run: |
+          scripts/config --file out/.config --disable KSU_TRACEPOINT_HOOK --enable KSU_SUSFS
+
+      - name: Set version and build info
+        run: |
+          # ReSukiSU版本号: v4.1.0-Samrtin@ReSukiSU
+          scripts/config --file out/.config --set-str KSU_FULL_NAME_FORMAT "%TAG_NAME%-Samrtin@%REPO_NAME%"
+          # 构建号信息
+          echo "BUILD_NUM=${{ github.run_number }}" >> $GITHUB_ENV
+          echo "BRANCH_NAME=${{ github.ref_name }}" >> $GITHUB_ENV
+          echo "REKERNEL_BRANCH=1.1" >> $GITHUB_ENV
+          echo "HOOK_TYPE=${{ inputs.hook_type }}" >> $GITHUB_ENV
+
+      - name: Build kernel
+        run: |
+          export ARCH=arm64
+          export SUBARCH=arm64
+          export PATH="$(pwd)/toolchains/clang/bin:/usr/lib/ccache:$PATH"
+          export CCACHE_DIR=~/.ccache
+          ccache -M 8G
+          make LLVM=1 LLVM_IAS=1 O=out LOCALVERSION=-AOSPA-BY@Samrtin Image -j$(nproc --all) 2>&1 | tee out/build.log
+          if [ ${PIPESTATUS[0]} -ne 0 ]; then
+            echo "Build failed"
+            exit 1
+          fi
+
+      - name: Package flashable zip
+        run: |
+          if [ -d tools/AK3 ] && [ -f out/arch/arm64/boot/Image ]; then
+            rm -rf out/AK3
+            cp -r tools/AK3 out/
+            cp out/arch/arm64/boot/Image out/AK3/Image
+            cd out/AK3
+            ZIPNAME="Fuxi-ReSukiSU-$(date -u '+%Y%m%d-%H%M').zip"
+            zip -r9 "$ZIPNAME" .
+            mv "$ZIPNAME" ../../
+            echo "Zip created"
+          else
+            echo "Image not found"
+            exit 1
+          fi
+
+      - name: Upload to Telegram
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+        run: |
+          ZIP_FILE=$(ls Fuxi-ReSukiSU-*.zip 2>/dev/null | head -1)
+          if [ -n "$ZIP_FILE" ] && [ -n "$TOKEN" ] && [ -n "$CHAT_ID" ]; then
+            RKS_COMMITS=$(curl -sI 'https://api.github.com/repos/ReSukiSU/ReSukiSU/commits?per_page=1' 2>/dev/null | grep -o 'page=[0-9]*>; rel="last"' | grep -o '[0-9]*')
+            RKS_COMMITS=${RKS_COMMITS:-0}
+            RKS_VER=$((30000 + RKS_COMMITS + 700))
+            SUSFS_LINE=""
+            NL=$'\n'
+            if [ "${{ inputs.hook_type }}" == "linehook" ]; then
+              SUSFS_LINE="${NL}✅ SUSFS ${SUSFS_VERSION:-v2.2.0}"
+            fi
+            CAPTION="✅ ReSukiSU 内核编译完成${NL}✅ ReSukiSU：${RKS_VER}${NL}✅ Hook: ${{ inputs.hook_type || 'Tracepoint' }}${NL}✅ ReKernel-X: ${RKX_VER}${NL}✅ BBR：V1${NL}✅ Lz4：1.10${SUSFS_LINE}${NL}构建号: ReSukiSU-${{ github.run_number }}"
+            curl -s -F chat_id="$CHAT_ID" \
+              -F document=@"$ZIP_FILE" \
+              -F "caption=$CAPTION" \
+              "https://api.telegram.org/bot${TOKEN}/sendDocument"
+          else
+            echo "Telegram upload skipped (missing token/chat_id or zip)"
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AospaFuxi-Kernel
+          path: "Fuxi-ReSukiSU-*.zip"
+          if-no-files-found: warn
+
+      - name: Create Release
+        if: success()
+        run: |
+          GH_TOKEN=${{ github.token }} gh release create ReSukiSU-Build-${{ github.run_number }} Fuxi-ReSukiSU-*.zip \
+            --repo ${{ github.repository }} \
+            --title "ReSukiSU 内核 #${{ github.run_number }}" \
+            --generate-notes
